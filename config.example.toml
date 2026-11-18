@@ -1,0 +1,14 @@
+[azure]
+tenant_id = "YOUR_TENANT_ID"
+client_id = "YOUR_APP_CLIENT_ID"
+client_secret = "YOUR_APP_CLIENT_SECRET"
+employee_group_id = "YOUR_EMPLOYEE_GROUP_ID"
+
+[snipe_it]
+url = "https://snipe.example.com"
+api_token = "YOUR_SNIPE_IT_API_TOKEN"
+
+[defaults]
+model_id = 1
+status_id = 1
+asset_tag_prefix = "INTUNE-"
