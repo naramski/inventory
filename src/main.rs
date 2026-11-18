@@ -1,12 +1,20 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 use ureq::{Agent, Request};
 use url::Url;
+
+fn empty_string_as_none<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|s| if s.trim().is_empty() { None } else { Some(s) }))
+}
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +38,48 @@ enum Command {
     Check,
     /// Normalize serial numbers in Snipe-IT (remove non-alphanumeric, uppercase).
     Normalise,
+    /// Check Lenovo warranty information for devices.
+    Lenovo,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UserCheckStatus {
+    CorrectlyAssigned,
+    UserMismatch,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IntuneDevice {
+    #[serde(default, rename = "deviceName")]
+    device_name: Option<String>,
+    #[serde(default, rename = "serialNumber")]
+    serial_number: Option<String>,
+    #[serde(default, rename = "operatingSystem")]
+    operating_system: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none", rename = "userPrincipalName")]
+    user_principal_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeUser {
+    id: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeDevice {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    asset_tag: Option<String>,
+    #[serde(default)]
+    serial: Option<String>,
+    #[serde(default)]
+    assigned_to: Option<SnipeUser>,
 }
 
 #[derive(Deserialize)]
@@ -56,13 +106,40 @@ struct SnipeConfig {
 #[derive(Deserialize)]
 struct DefaultsConfig {
     model_id: u64,
-    status_id: u64,
+    #[serde(default = "default_ready_to_deploy_status_id")]
+    ready_to_deploy_status_id: u64,
+    #[serde(default = "default_assigned_status_id")]
+    assigned_status_id: u64,
     #[serde(default = "default_asset_tag_prefix")]
     asset_tag_prefix: String,
 }
 
 fn default_asset_tag_prefix() -> String {
     "INTUNE-".to_owned()
+}
+
+fn default_ready_to_deploy_status_id() -> u64 {
+    2
+}
+
+fn default_assigned_status_id() -> u64 {
+    4
+}
+
+fn is_supported_os(device: &IntuneDevice) -> bool {
+    let operating_system = device.operating_system.as_deref().unwrap_or_default();
+    ["Windows", "Linux", "macOS"]
+        .iter()
+        .any(|supported| operating_system.eq_ignore_ascii_case(supported))
+}
+
+fn is_serial_number_present(device: &IntuneDevice) -> bool {
+    device
+        .serial_number
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .len() > 0
 }
 
 struct App {
@@ -84,6 +161,7 @@ fn main() -> Result<()> {
         Command::Employees => app.sync_employees(),
         Command::Check => app.check_assignments(),
         Command::Normalise => app.normalise_serials(),
+        Command::Lenovo => app.check_lenovo_warranty(),
     }
 }
 
@@ -118,54 +196,214 @@ impl App {
         })
     }
 
-    fn sync_devices(&self) -> Result<()> {
-        let devices = self.graph_collection(
-            "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=deviceName,serialNumber,operatingSystem",
+    fn get_snipe_devices(&self) -> Result<Vec<SnipeDevice>> {
+        let snipe_hardware = self.snipe_request("GET", "hardware", None)?;
+        let snipe_devices = snipe_hardware["rows"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(snipe_devices)
+    }
+
+    fn get_intune_devices(&self) -> Result<Vec<IntuneDevice>> {
+        let devices_json = self.graph_collection(
+            "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=deviceName,serialNumber,operatingSystem,userPrincipalName,userDisplayName",
         )?;
+        let devices = devices_json
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+
+        Ok(devices)
+    }
+
+    fn create_device_in_snipe(&self, device: &IntuneDevice, serial: &str) -> Result<()> {
+        let name = device
+            .device_name
+            .as_deref()
+            .unwrap_or_else(|| serial);
+        let asset_tag = format!("{}{}", self.config.defaults.asset_tag_prefix, serial);
+        let payload = json!({
+            "name": name,
+            "asset_tag": asset_tag,
+            "serial": serial,
+            "model_id": self.config.defaults.model_id,
+            "status_id": self.config.defaults.ready_to_deploy_status_id,
+        });
+        self.snipe_request("POST", "hardware", Some(&payload))?;
+        println!("Created asset {asset_tag}");
+        Ok(())
+    }
+
+    fn assign_device_in_snipe(&self, device_id: u64, device_name: &str, user: &SnipeUser, intune_email: &str) -> Result<UserCheckStatus> {
+        if let Some(snipe_user_id) = user.id {
+            let payload = json!({
+                "assigned_to": snipe_user_id,
+                "status_id": self.config.defaults.assigned_status_id,
+            });
+            match self.snipe_request("PATCH", &format!("hardware/{}", device_id), Some(&payload)) {
+                Ok(_) => {
+                    if let Some(snipe_name) = &user.name {
+                        println!("✓ Updated {} assignment to '{}' ({})", device_name, snipe_name, intune_email);
+                    } else {
+                        println!("✓ Updated {} assignment to '{}'", device_name, intune_email);
+                    }
+                    Ok(UserCheckStatus::CorrectlyAssigned)
+                }
+                Err(_) => {
+                    eprintln!("⚠️  Failed to update {} assignment from Intune user '{}'", device_name, intune_email);
+                    Ok(UserCheckStatus::UserMismatch)
+                }
+            }
+        } else {
+            eprintln!("⚠️  Could not parse Snipe-IT user ID for Intune user '{}'", intune_email);
+            Ok(UserCheckStatus::UserMismatch)
+        }
+    }
+
+    fn sync_devices(&self) -> Result<()> {
+        let devices = self.get_intune_devices()?;
+
+        let snipe_devices = self.get_snipe_devices()?;
+        
         let mut created = 0;
         let mut existing = 0;
         let mut skipped = 0;
+        let mut user_mismatch = 0;
+        let mut correctly_assigned = 0;
 
         for device in devices {
-            let operating_system = text(&device, "operatingSystem").unwrap_or_default();
-            if !["Windows", "Linux", "macOS"]
-                .iter()
-                .any(|supported| operating_system.eq_ignore_ascii_case(supported))
-            {
+
+            /* Skip devices that are not running a supported operating system */
+            if !is_supported_os(&device) {
                 continue;
             }
 
-            let serial = text(&device, "serialNumber")
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            if serial.is_empty() {
-                eprintln!("Skipping {}: no serial number", display_device(&device));
+            if !is_serial_number_present(&device) {
+                let device_name = device.device_name.as_deref().unwrap_or("unnamed device");
+                eprintln!("Skipping {}: no serial number", device_name);
                 skipped += 1;
                 continue;
             }
 
-            if self.snipe_hardware_by_serial(&serial)?.is_some() {
+            let serial = device
+                .serial_number
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+
+            // Look for device in Snipe-IT by normalized serial
+            let normalized_input = normalize_serial(&serial);
+            let existing_snipe_device = snipe_devices.iter().find(|row| {
+                row.serial
+                    .as_ref()
+                    .map(|s| normalize_serial(s))
+                    == Some(normalized_input.clone())
+            });
+
+            if let Some(snipe_dev) = existing_snipe_device {
+                // Update asset name if not set and device name is available in Intune
+                if (snipe_dev.name.is_none() || snipe_dev.name.as_deref() == Some("")) 
+                    && device.device_name.is_some() 
+                    && device.device_name.as_deref() != Some("") 
+                {
+                    if let Some(device_name) = &device.device_name {
+                        let update_payload = json!({
+                            "name": device_name,
+                        });
+                        match self.snipe_request("PATCH", &format!("hardware/{}", snipe_dev.id), Some(&update_payload)) {
+                            Ok(_) => { 
+                                println!("Updated asset name for {} to '{}'", snipe_dev.asset_tag.as_deref().unwrap_or("unknown"), device_name);
+                            },
+                            Err(e) => eprintln!("Failed to update asset name for {}: {}", snipe_dev.asset_tag.as_deref().unwrap_or("unknown"), e),
+                        }
+                    }
+                }
+                
+                // Check if primary user from Intune matches assigned user in Snipe-IT
+                match self.check_device_user_mismatch(snipe_dev, &device) {
+                    Ok(status) => {
+                        match status {
+                            UserCheckStatus::CorrectlyAssigned => correctly_assigned += 1,
+                            UserCheckStatus::UserMismatch => user_mismatch += 1,
+                        }
+                    }
+                    Err(e) => eprintln!("Error checking device: {}", e),
+                }
                 existing += 1;
                 continue;
             }
 
-            let name = text(&device, "deviceName").unwrap_or_else(|| serial.clone());
-            let asset_tag = format!("{}{}", self.config.defaults.asset_tag_prefix, serial);
-            let payload = json!({
-                "name": name,
-                "asset_tag": asset_tag,
-                "serial": serial,
-                "model_id": self.config.defaults.model_id,
-                "status_id": self.config.defaults.status_id,
-            });
-            self.snipe_request("POST", "hardware", Some(&payload))?;
-            println!("Created asset {asset_tag}");
+            self.create_device_in_snipe(&device, &serial)?;
             created += 1;
         }
 
         println!("Devices: {created} created, {existing} already present, {skipped} skipped");
+        if existing > 0 {
+            println!("  - {} correctly assigned", correctly_assigned);
+            if user_mismatch > 0 {
+                println!("  - {} have user mismatch (assigned ≠ checked out)", user_mismatch);
+            }
+        }
         Ok(())
+    }
+
+    fn check_device_user_mismatch(&self, snipe_device: &SnipeDevice, intune_device: &IntuneDevice) -> Result<UserCheckStatus> {
+        let device_name = snipe_device
+            .name
+            .as_ref()
+            .or(snipe_device.asset_tag.as_ref())
+            .cloned()
+            .unwrap_or_else(|| format!("ID {}", snipe_device.id));
+        
+        // Get primary user email from Intune (userPrincipalName is the user's email)
+        let intune_primary_user_email = intune_device.user_principal_email.as_deref();
+        
+        // Get assigned user from Snipe-IT
+        let snipe_assigned_user = snipe_device.assigned_to.as_ref();
+        let snipe_assigned_email = snipe_assigned_user.and_then(|u| u.email.as_deref());
+        let snipe_assigned_id: Option<u64> = snipe_assigned_user.and_then(|u| u.id);
+        let snipe_assigned_name = snipe_assigned_user.and_then(|u| u.name.as_deref());
+        
+        match (intune_primary_user_email, snipe_assigned_email, snipe_assigned_id, snipe_assigned_name) {
+            // Both have users and emails match
+            (Some(intune_email), Some(snipe_email), _, Some(snipe_name)) 
+                if intune_email.to_lowercase() == snipe_email.to_lowercase() => {
+                println!("✓ {} is correctly assigned to '{}' ({})", device_name, snipe_name, snipe_email);
+                Ok(UserCheckStatus::CorrectlyAssigned)
+            }
+            // Intune has user but Snipe-IT is empty - update Snipe-IT
+            (Some(intune_email), None, _, _) => {
+                // Look up user in Snipe-IT by email
+                match self.snipe_user_by_email(intune_email)? {
+                    Some(user) => {
+                        self.assign_device_in_snipe(snipe_device.id, &device_name, &user, intune_email)
+                    }
+                    None => {
+                        eprintln!("⚠️  Intune user '{}' not found in Snipe-IT for device {}", intune_email, device_name);
+                        Ok(UserCheckStatus::UserMismatch)
+                    }
+                }
+            }
+            // Both have users but emails don't match - alert
+            (Some(intune_email), Some(snipe_email), _, Some(snipe_name)) 
+                if intune_email.to_lowercase() != snipe_email.to_lowercase() => {
+                eprintln!("⚠️  User mismatch for {}: Intune user '{}', Snipe-IT assigned '{}' ({})", 
+                    device_name, intune_email, snipe_name, snipe_email);
+                Ok(UserCheckStatus::UserMismatch)
+            }
+            // Snipe-IT has user but Intune doesn't
+            (None, Some(snipe_email), _, Some(snipe_name)) => {
+                println!("✓ {} is assigned to '{}' ({})", device_name, snipe_name, snipe_email);
+                Ok(UserCheckStatus::CorrectlyAssigned)
+            }
+            _ => Ok(UserCheckStatus::CorrectlyAssigned),
+        }
     }
 
     fn sync_employees(&self) -> Result<()> {
@@ -193,10 +431,8 @@ impl App {
             }
 
             if let Some(user) = self.snipe_user_by_email(&email)? {
-                let user_email = text(&user, "email");
-                if user_email.is_none() || user_email.as_deref() == Some("") {
-                    let user_id = user["id"]
-                        .as_u64()
+                if user.email.is_none() || user.email.as_deref() == Some("") {
+                    let user_id = user.id
                         .ok_or_else(|| anyhow!("Snipe-IT user has no numeric id"))?;
                     let (first_name, last_name) = employee_names(&employee);
                     let update_payload = json!({
@@ -262,8 +498,7 @@ impl App {
                 missing_employee += 1;
                 continue;
             };
-            let user_id = user["id"]
-                .as_u64()
+            let user_id = user.id
                 .ok_or_else(|| anyhow!("Snipe-IT employee {email} has no numeric id"))?;
             let assets = self.snipe_request("GET", &format!("users/{user_id}/assets"), None)?;
             let rows = assets["rows"].as_array().cloned().unwrap_or_default();
@@ -284,19 +519,19 @@ impl App {
 
     fn normalise_serials(&self) -> Result<()> {
         let hardware = self.snipe_request("GET", "hardware", None)?;
-        let rows = hardware["rows"]
+        let rows: Vec<SnipeDevice> = hardware["rows"]
             .as_array()
-            .cloned()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
             .unwrap_or_default();
         let mut updated = 0;
         let mut skipped = 0;
 
         for device in rows {
-            let device_id = device["id"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("Device has no numeric id"))?;
-            
-            if let Some(current_serial) = text(&device, "serial") {
+            if let Some(current_serial) = &device.serial {
                 let trimmed = current_serial.trim();
                 if trimmed.is_empty() {
                     skipped += 1;
@@ -305,11 +540,15 @@ impl App {
 
                 let normalized = normalize_serial(trimmed);
                 if normalized != trimmed {
-                    let device_name = text(&device, "name").unwrap_or_else(|| format!("ID {device_id}"));
+                    let device_name = device
+                        .name
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| format!("ID {}", device.id));
                     let payload = json!({
                         "serial": normalized,
                     });
-                    self.snipe_request("PUT", &format!("hardware/{device_id}"), Some(&payload))?;
+                    self.snipe_request("PUT", &format!("hardware/{}", device.id), Some(&payload))?;
                     println!("Updated {device_name}: {trimmed} → {normalized}");
                     updated += 1;
                 }
@@ -320,6 +559,140 @@ impl App {
 
         println!("Serial numbers: {updated} normalized, {skipped} skipped");
         Ok(())
+    }
+
+    fn check_lenovo_warranty(&self) -> Result<()> {
+        let hardware = self.snipe_request("GET", "hardware", None)?;
+        let rows: Vec<SnipeDevice> = hardware["rows"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut checked = 0;
+        let mut updated = 0;
+        let mut failed = 0;
+
+        for device in rows {
+            if let Some(serial) = &device.serial {
+                let device_name = device
+                    .name
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| serial.clone());
+                match self.get_lenovo_warranty_info(serial) {
+                    Ok(warranty_info) => {
+                        if let Some((start_date, product_name)) = warranty_info {
+                            println!("{}: {} - Warranty start date: {}", device_name, product_name, start_date);
+                            
+                            if let Err(e) = self.update_snipe_purchase_date(device.id, &start_date) {
+                                eprintln!("Failed to update purchase date for {}: {}", device_name, e);
+                                failed += 1;
+                            } else {
+                                updated += 1;
+                            }
+                        } else {
+                            println!("{}: No warranty information found", device_name);
+                        }
+                        checked += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("{}: Error checking warranty - {}", device_name, e);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        println!("Lenovo warranty check: {checked} checked, {updated} purchase dates updated, {failed} failed");
+        Ok(())
+    }
+
+    fn update_snipe_purchase_date(&self, device_id: u64, start_date: &str) -> Result<()> {
+        let payload = json!({
+            "purchase_date": start_date,
+        });
+        self.snipe_request("PUT", &format!("hardware/{device_id}"), Some(&payload))?;
+        Ok(())
+    }
+
+    fn get_lenovo_warranty_info(&self, serial: &str) -> Result<Option<(String, String)>> {
+        let normalized_serial = normalize_serial(serial).to_uppercase();
+        
+        let product_info = self.get_lenovo_product_info(&normalized_serial)?;
+        if product_info.is_empty() {
+            return Ok(None);
+        }
+
+        let product_id = &product_info[0];
+        let machine_type = self.extract_machine_type(product_id)?;
+        
+        let warranty_info = self.get_lenovo_ibase_info(&normalized_serial, &machine_type)?;
+        Ok(warranty_info)
+    }
+
+    fn get_lenovo_product_info(&self, serial: &str) -> Result<Vec<Value>> {
+        let payload = json!({
+            "productId": serial
+        });
+
+        let url = "https://pcsupport.lenovo.com/lu/en/api/v4/mse/v2/getproducts";
+        let request = self.agent
+            .post(url)
+            .set("Content-Type", "application/json")
+            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+
+        let response = send_json(request, Some(&payload))
+            .context("Failed to get Lenovo product info")?;
+
+        if let Some(arr) = response.as_array() {
+            Ok(arr.clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn extract_machine_type(&self, product: &Value) -> Result<String> {
+        let full_id = product["Id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Product has no Id field"))?;
+        
+        let parts: Vec<&str> = full_id.split('/').collect();
+        if parts.len() >= 4 {
+            Ok(parts[3].to_owned())
+        } else {
+            Err(anyhow!("Cannot extract machine type from product id"))
+        }
+    }
+
+    fn get_lenovo_ibase_info(&self, serial: &str, machine_type: &str) -> Result<Option<(String, String)>> {
+        let payload = json!({
+            "serialNumber": serial,
+            "machineType": machine_type,
+            "country": "lu",
+            "language": "en"
+        });
+
+        let url = "https://pcsupport.lenovo.com/lu/en/api/v4/upsell/redport/getIbaseInfo";
+        let request = self.agent
+            .post(url)
+            .set("Content-Type", "application/json")
+            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+
+        let response = send_json(request, Some(&payload))
+            .context("Failed to get Lenovo warranty info")?;
+
+        if let Some(data) = response.get("data").and_then(|d| d.get("machineInfo")) {
+            if let Some(start_date) = data.get("baseStartDate").and_then(|d| d.as_str()) {
+                if let Some(product_name) = data.get("productName").and_then(|n| n.as_str()) {
+                    return Ok(Some((start_date.to_owned(), product_name.to_owned())));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn graph_collection(&self, first_url: &str) -> Result<Vec<Value>> {
@@ -343,6 +716,7 @@ impl App {
         Ok(rows)
     }
 
+    #[allow(dead_code)]
     fn snipe_hardware_by_serial(&self, serial: &str) -> Result<Option<Value>> {
         let mut url = self.snipe_url(&["hardware"])?;
         url.query_pairs_mut().append_pair("search", serial);
@@ -363,18 +737,17 @@ impl App {
         Ok(found)
     }
 
-    fn snipe_user_by_email(&self, email: &str) -> Result<Option<Value>> {
-        let username = username_from_email(email);
+    fn snipe_user_by_email(&self, email: &str) -> Result<Option<SnipeUser>> {
         let mut url = self.snipe_url(&["users"])?;
-        url.query_pairs_mut().append_pair("search", &username);
+        url.query_pairs_mut().append_pair("search", email);
         let result = self.snipe_get_url(url.as_str())?;
         let found = result["rows"]
             .as_array()
             .and_then(|rows| {
                 rows.iter()
-                    .find(|row| text(row, "username").as_deref() == Some(&username))
+                    .find(|row| text(row, "email").as_deref() == Some(email))
             })
-            .cloned();
+            .and_then(|row| serde_json::from_value(row.clone()).ok());
         Ok(found)
     }
 
@@ -441,10 +814,6 @@ fn text(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn username_from_email(email: &str) -> String {
-    email.split('@').next().unwrap_or("").to_owned()
-}
-
 fn generate_random_password(length: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
     let mut rng = rand::thread_rng();
@@ -454,10 +823,6 @@ fn generate_random_password(length: usize) -> String {
             CHARSET[idx] as char
         })
         .collect()
-}
-
-fn display_device(device: &Value) -> String {
-    text(device, "deviceName").unwrap_or_else(|| "unnamed device".to_owned())
 }
 
 fn display_employee(employee: &Value) -> String {

@@ -10,5 +10,6 @@ api_token = "YOUR_SNIPE_IT_API_TOKEN"
 
 [defaults]
 model_id = 1
-status_id = 1
+ready_to_deploy_status_id = 2
+assigned_status_id = 4
 asset_tag_prefix = "INTUNE-"
