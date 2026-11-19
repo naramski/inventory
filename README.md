@@ -7,7 +7,10 @@ Inventory reconciles Microsoft Intune and Entra ID with Snipe-IT.
 - `inventory devices` finds Windows, Linux, and macOS devices in Intune and creates missing Snipe-IT assets, matching by serial number.
 - `inventory owner` compares the Intune primary user of each device with the Snipe-IT assignee, matching users by email. Unassigned assets are checked out to the Intune primary user when that user exists in Snipe-IT. Existing assignments are not replaced; mismatches, assignments without an email, and devices missing from Snipe-IT are reported.
 - `inventory employee` finds active Entra ID users and creates missing Snipe-IT users, matching by email.
-- `inventory check` reports active Entra ID users missing from Snipe-IT or without an assigned Snipe-IT asset. It also warns about Snipe-IT assets whose serial number is not found in Intune, unless their status label is "Server mode"; those assets are set to the "Not In Intune" status label, which must exist in Snipe-IT.
+- `inventory check` reports active Entra ID users missing from Snipe-IT, and warns when an employee has no laptop or more than one laptop assigned (assets in the Snipe-IT category "Laptop", matched by email) and when a laptop is not assigned to anyone ("Server mode" assets excepted). It also warns about Snipe-IT assets whose serial number is not found in Intune, unless their status label is "Server mode"; those assets are set to the "Not In Intune" status label, which must exist in Snipe-IT.
+- `inventory lenovo` looks up the Lenovo warranty start date of Snipe-IT assets that have a serial number but no purchase date, and sets it as their purchase date. With `--all`, every asset with a serial number is checked and updated.
+
+- `inventory replace` lists assigned Snipe-IT laptops (category "Laptop", "Server mode" assets excepted) whose end-of-life date has passed, and those reaching end of life within the next 90 days, with the laptop keyboard (asset custom field "Keyboard") and the keyboard requested by the user (a `Keyboard: XXXX` line in the user notes, read only). It also counts the laptops reaching end of life during the current year and the next year.
 
 Run a command with `--help` for CLI options. The config file defaults to `config.toml`; override it with `--config PATH`.
 

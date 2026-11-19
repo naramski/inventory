@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use ureq::{Agent, Request};
@@ -52,8 +52,14 @@ enum Command {
     Check,
     /// Normalize serial numbers in Snipe-IT (remove non-alphanumeric, uppercase).
     Normalise,
-    /// Check Lenovo warranty information for devices.
-    Lenovo,
+    /// Set the Snipe-IT purchase date from the Lenovo warranty start date.
+    Lenovo {
+        /// Update every device with a serial number, not only those without a purchase date.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Report laptops at end of life or to replace soon ("Server mode" excepted).
+    Replace,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +88,40 @@ struct SnipeUser {
     name: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    /// Read only: never sent back to Snipe-IT.
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+const KEYBOARD_NOTE_PREFIX: &str = "Keyboard:";
+
+impl SnipeUser {
+    /// Keyboard layout requested in the notes (`Keyboard: XXXX` line).
+    fn get_keyboard_layout(&self) -> Option<&str> {
+        self.notes
+            .as_deref()?
+            .split(['\n', '\r'])
+            .flat_map(|line| line.split("<br>"))
+            .find_map(|line| line.trim().strip_prefix(KEYBOARD_NOTE_PREFIX))
+            .map(str::trim)
+            .filter(|layout| !layout.is_empty())
+    }
+}
+
+/// Custom field value returned by the Snipe-IT API.
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeCustomField {
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// Snipe-IT returns `[]` instead of `{}` when an asset has no custom fields.
+fn custom_fields_or_empty<'de, D>(deserializer: D) -> std::result::Result<HashMap<String, SnipeCustomField>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +144,50 @@ struct SnipeDevice {
     assigned_to: Option<SnipeUser>,
     #[serde(default)]
     status_label: Option<SnipeStatusLabel>,
+    #[serde(default)]
+    purchase_date: Option<SnipeDate>,
+    #[serde(default)]
+    asset_eol_date: Option<SnipeDate>,
+    #[serde(default)]
+    model: Option<SnipeNamedRef>,
+    #[serde(default)]
+    category: Option<SnipeNamedRef>,
+    #[serde(default, deserialize_with = "custom_fields_or_empty")]
+    custom_fields: HashMap<String, SnipeCustomField>,
+}
+
+/// `{"id": ..., "name": ...}` reference (model, category, manufacturer...).
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeNamedRef {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Body of `POST models`.
+#[derive(Debug, Serialize)]
+struct NewSnipeModel<'a> {
+    name: &'a str,
+    category_id: u64,
+    manufacturer_id: u64,
+    fieldset_id: u64,
+    depreciation_id: u64,
+}
+
+/// Date object returned by the Snipe-IT API (`{"date": ..., "formatted": ...}`).
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeDate {
+    #[serde(default)]
+    date: Option<String>,
+}
+
+impl SnipeDevice {
+    fn has_purchase_date(&self) -> bool {
+        self.purchase_date
+            .as_ref()
+            .and_then(|d| d.date.as_deref())
+            .is_some_and(|d| !d.trim().is_empty())
+    }
 }
 
 /// Body of `POST hardware`.
@@ -127,6 +211,10 @@ struct SnipeAssetUpdate<'a> {
     serial: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     purchase_date: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_eol_date: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<u64>,
 }
 
 /// Body of `POST hardware/{id}/checkout`.
@@ -172,6 +260,53 @@ struct LenovoIbaseQuery<'a> {
     language: &'a str,
 }
 
+/// Item returned by Lenovo `getproducts`.
+#[derive(Debug, Deserialize)]
+struct LenovoProductInfo {
+    /// e.g. `LAPTOPS-AND-NETBOOKS/THINKPAD-T-SERIES-LAPTOPS/THINKPAD-T14-GEN-3-TYPE-21AH-21AJ/21AH/21AHCTO1WW/<serial>`
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+impl LenovoProductInfo {
+    fn machine_type(&self) -> Result<&str> {
+        self.id
+            .split('/')
+            .nth(3)
+            .ok_or_else(|| anyhow!("Cannot extract machine type from product id {}", self.id))
+    }
+}
+
+/// Response of Lenovo `getIbaseInfo`.
+#[derive(Debug, Default, Deserialize)]
+struct LenovoIbaseResponse {
+    #[serde(default)]
+    data: Option<LenovoIbaseData>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LenovoIbaseData {
+    #[serde(default)]
+    machine_info: Option<LenovoWarrantyInfo>,
+}
+
+/// `data.machineInfo` of Lenovo `getIbaseInfo`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LenovoWarrantyInfo {
+    product_name: String,
+    base_start_date: String,
+}
+
+impl LenovoWarrantyInfo {
+    /// `product_name` up to the first `(`, trimmed.
+    fn model_name(&self) -> Option<&str> {
+        let name = self.product_name.split('(').next().unwrap_or_default().trim();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
 impl SnipeDevice {
     /// Name, else asset tag, else ID (empty values are skipped)
     fn display_name(&self) -> String {
@@ -183,6 +318,36 @@ impl SnipeDevice {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("ID {}", self.id))
     }
+    fn is_laptop(&self) -> bool {
+        self.category
+            .as_ref()
+            .and_then(|c| c.name.as_deref())
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(LAPTOP_CATEGORY))
+    }
+    /// Lowercase email of the assigned user, if any.
+    fn assignee_email(&self) -> Option<String> {
+        self.assigned_to
+            .as_ref()
+            .and_then(|u| u.email.as_deref())
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty())
+    }
+    /// End-of-life date as `YYYY-MM-DD`, if set.
+    fn eol_date(&self) -> Option<&str> {
+        self.asset_eol_date
+            .as_ref()
+            .and_then(|d| d.date.as_deref())
+            .and_then(|d| d.trim().get(..10))
+    }
+    /// Value of the "Keyboard" custom field, if set.
+    fn keyboard_layout(&self) -> Option<&str> {
+        self.custom_fields
+            .iter()
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case(KEYBOARD_FIELD))
+            .and_then(|(_, field)| field.value.as_deref())
+            .map(str::trim)
+            .filter(|layout| !layout.is_empty())
+    }
     fn match_asset_tag(&self, asset_tag: &str) -> bool {
         self.asset_tag
             .as_deref()
@@ -193,6 +358,75 @@ impl SnipeDevice {
 
 const SERVER_MODE_STATUS: &str = "Server mode";
 const NOT_IN_INTUNE_STATUS: &str = "Not in Intune";
+const LAPTOP_CATEGORY: &str = "Laptop";
+const KEYBOARD_FIELD: &str = "Keyboard";
+
+/// Snipe-IT laptops grouped by assignee email (lowercase).
+fn laptops_by_assignee(snipe_devices: &[SnipeDevice]) -> HashMap<String, Vec<&SnipeDevice>> {
+    let mut laptops: HashMap<String, Vec<&SnipeDevice>> = HashMap::new();
+    for device in snipe_devices.iter().filter(|d| d.is_laptop()) {
+        if let Some(email) = device.assignee_email() {
+            laptops.entry(email).or_default().push(device);
+        }
+    }
+    laptops
+}
+
+/// Snipe-IT laptops not checked out to anyone (ignoring "Server mode" assets).
+fn unassigned_laptops(snipe_devices: &[SnipeDevice]) -> Vec<&SnipeDevice> {
+    snipe_devices
+        .iter()
+        .filter(|d| d.is_laptop() && d.assigned_to.is_none() && !is_server_mode(d))
+        .collect()
+}
+
+/// Assigned laptops (not in "Server mode") to replace, based on their end-of-life date.
+struct ReplacementReport<'a> {
+    /// End of life on or before today.
+    end_of_life: Vec<&'a SnipeDevice>,
+    /// End of life after today and within the next 90 days.
+    within_three_months: Vec<&'a SnipeDevice>,
+    /// End of life during the current year.
+    current_year: usize,
+    /// End of life during the next year.
+    next_year: usize,
+    /// Laptops without an end-of-life date.
+    without_eol: usize,
+}
+
+const REPLACEMENT_NOTICE_DAYS: i64 = 90;
+
+fn replacement_report<'a>(snipe_devices: &'a [SnipeDevice], today: &str) -> Result<ReplacementReport<'a>> {
+    let horizon = add_days(today, REPLACEMENT_NOTICE_DAYS)?;
+    let year: i32 = today[..4].parse()?;
+    let (current_year, next_year) = (year.to_string(), (year + 1).to_string());
+    let mut report = ReplacementReport {
+        end_of_life: Vec::new(),
+        within_three_months: Vec::new(),
+        current_year: 0,
+        next_year: 0,
+        without_eol: 0,
+    };
+    let mut laptops: Vec<&SnipeDevice> = snipe_devices.iter().filter(|d| d.is_laptop() && d.assigned_to.is_some() && !is_server_mode(d)).collect();
+    laptops.sort_by(|a, b| a.eol_date().cmp(&b.eol_date()));
+    for device in laptops {
+        let Some(eol) = device.eol_date() else {
+            report.without_eol += 1;
+            continue;
+        };
+        if eol <= today {
+            report.end_of_life.push(device);
+        } else if eol <= horizon.as_str() {
+            report.within_three_months.push(device);
+        }
+        if eol.starts_with(&current_year) {
+            report.current_year += 1;
+        } else if eol.starts_with(&next_year) {
+            report.next_year += 1;
+        }
+    }
+    Ok(report)
+}
 
 fn has_status(device: &SnipeDevice, status: &str) -> bool {
     device
@@ -207,15 +441,17 @@ fn is_server_mode(device: &SnipeDevice) -> bool {
 }
 
 /// Snipe-IT asset matching an Intune device: by serial number (normalized on
-/// deserialization), or by asset tag = Intune device ID when there is no serial.
+/// deserialization), else by asset tag = Intune device ID.
 fn find_snipe_device<'a>(snipe_devices: &'a [SnipeDevice], device: &IntuneDevice) -> Option<&'a SnipeDevice> {
-    match device.serial_number.as_deref() {
-        Some(serial) => snipe_devices.iter().find(|d| d.serial.as_deref() == Some(serial)),
-        None => snipe_devices.iter().find(|d| d.match_asset_tag(&device.id)),
-    }
+    device
+        .serial_number
+        .as_deref()
+        .and_then(|serial| snipe_devices.iter().find(|d| d.serial.as_deref() == Some(serial)))
+        .or_else(|| snipe_devices.iter().find(|d| d.match_asset_tag(&device.id)))
 }
 
-/// Snipe-IT devices with a serial number that no Intune device reports.
+/// Snipe-IT devices with a serial number that no Intune device reports,
+/// neither by serial number nor by asset tag = Intune device ID.
 fn snipe_devices_missing_from_intune<'a>(
     snipe_devices: &'a [SnipeDevice],
     intune_devices: &[IntuneDevice],
@@ -230,7 +466,9 @@ fn snipe_devices_missing_from_intune<'a>(
         .iter()
         .filter(|d| {
             let serial = normalize_serial(d.serial.as_deref().unwrap_or_default());
-            !serial.is_empty() && !intune_serials.contains(&serial)
+            !serial.is_empty()
+                && !intune_serials.contains(&serial)
+                && !intune_devices.iter().any(|i| d.match_asset_tag(&i.id))
         })
         .collect()
 }
@@ -280,6 +518,8 @@ struct App {
     config: Config,
     graph_token: String,
     status_labels: OnceCell<Vec<SnipeStatusLabel>>,
+    /// Snipe-IT model IDs by lowercase name.
+    model_ids: RefCell<HashMap<String, u64>>,
 }
 
 fn main() -> Result<()> {
@@ -296,7 +536,8 @@ fn main() -> Result<()> {
         Command::Employees => app.sync_employees(),
         Command::Check => app.check_assignments(),
         Command::Normalise => app.normalise_serials(),
-        Command::Lenovo => app.check_lenovo_warranty(),
+        Command::Lenovo { all } => app.check_lenovo_warranty(all),
+        Command::Replace => app.report_replacements(),
     }
 }
 
@@ -329,6 +570,7 @@ impl App {
             config,
             graph_token,
             status_labels: OnceCell::new(),
+            model_ids: RefCell::new(HashMap::new()),
         })
     }
 
@@ -343,6 +585,30 @@ impl App {
             })
             .unwrap_or_default();
         Ok(snipe_devices)
+    }
+
+    /// Every Snipe-IT user (paginated).
+    fn get_snipe_users(&self) -> Result<Vec<SnipeUser>> {
+        const PAGE: usize = 500;
+        let mut users = Vec::new();
+        loop {
+            let mut url = self.snipe_url(&["users"])?;
+            url.query_pairs_mut()
+                .append_pair("limit", &PAGE.to_string())
+                .append_pair("offset", &users.len().to_string());
+            let result = self.snipe_get_url(url.as_str())?;
+            let rows = result["rows"]
+                .as_array()
+                .ok_or_else(|| anyhow!("Snipe-IT users response did not contain a rows array"))?;
+            let count = rows.len();
+            for row in rows {
+                users.push(serde_json::from_value(row.clone()).context("invalid Snipe-IT user")?);
+            }
+            let total = result["total"].as_u64().unwrap_or(0) as usize;
+            if count < PAGE || users.len() >= total {
+                return Ok(users);
+            }
+        }
     }
 
     fn get_intune_devices(&self) -> Result<Vec<IntuneDevice>> {
@@ -612,8 +878,12 @@ impl App {
         let employees = self.graph_collection(
             &format!("https://graph.microsoft.com/v1.0/groups/{group_id}/members?$select=displayName,mail,userPrincipalName,accountEnabled"),
         )?;
+        let intune_devices = self.get_intune_devices()?;
+        let snipe_devices = self.get_snipe_devices()?;
+        let laptops = laptops_by_assignee(&snipe_devices);
         let mut missing_employee = 0;
-        let mut without_device = 0;
+        let mut without_laptop = 0;
+        let mut several_laptops = 0;
 
         for employee in employees {
             if employee["accountEnabled"].as_bool() != Some(true) {
@@ -627,28 +897,43 @@ impl App {
                 continue;
             }
 
-            let Some(user) = self.snipe_user_by_email(&email)? else {
+            if self.snipe_user_by_email(&email)?.is_none() {
                 println!(
                     "Missing Snipe-IT employee: {} ({email})",
                     display_employee(&employee)
                 );
                 missing_employee += 1;
                 continue;
-            };
-            let user_id = user.id;
-            let assets = self.snipe_get(&format!("users/{user_id}/assets"))?;
-            let rows = assets["rows"].as_array().cloned().unwrap_or_default();
-            if rows.is_empty() {
-                println!(
-                    "No device assigned: {} ({email})",
-                    display_employee(&employee)
-                );
-                without_device += 1;
+            }
+            match laptops.get(&email.trim().to_lowercase()).map(Vec::as_slice).unwrap_or_default() {
+                [] => {
+                    eprintln!("⚠️  {} ({email}) has no laptop assigned", display_employee(&employee));
+                    without_laptop += 1;
+                }
+                [_] => {}
+                several => {
+                    let names: Vec<String> = several.iter().map(|d| d.display_name()).collect();
+                    eprintln!(
+                        "⚠️  {} ({email}) has {} laptops assigned: {}",
+                        display_employee(&employee),
+                        several.len(),
+                        names.join(", ")
+                    );
+                    several_laptops += 1;
+                }
             }
         }
 
-        let intune_devices = self.get_intune_devices()?;
-        let snipe_devices = self.get_snipe_devices()?;
+        let unassigned = unassigned_laptops(&snipe_devices);
+        for device in &unassigned {
+            let status = device
+                .status_label
+                .as_ref()
+                .and_then(|label| label.name.as_deref())
+                .unwrap_or("unknown");
+            eprintln!("⚠️  Laptop {} is not assigned to anyone, status '{status}'", device.display_name());
+        }
+
         let mut server_mode = 0;
         let mut missing_from_intune = 0;
         let mut marked = 0;
@@ -686,8 +971,43 @@ impl App {
         }
 
         println!(
-            "Check complete: {missing_employee} employees missing from Snipe-IT, {without_device} without a device, {missing_from_intune} devices missing from Intune ({marked} marked '{NOT_IN_INTUNE_STATUS}', {server_mode} in '{SERVER_MODE_STATUS}' ignored)"
+            "Check complete: {missing_employee} employees missing from Snipe-IT, {without_laptop} without a laptop, {several_laptops} with several laptops, {} unassigned laptops, {missing_from_intune} devices missing from Intune ({marked} marked '{NOT_IN_INTUNE_STATUS}', {server_mode} in '{SERVER_MODE_STATUS}' ignored)",
+            unassigned.len()
         );
+        Ok(())
+    }
+
+    fn report_replacements(&self) -> Result<()> {
+        let snipe_devices = self.get_snipe_devices()?;
+        let users: HashMap<u64, SnipeUser> = self.get_snipe_users()?.into_iter().map(|u| (u.id, u)).collect();
+        let today = today();
+        let report = replacement_report(&snipe_devices, &today)?;
+        let line = |device: &SnipeDevice| {
+            let user = device.assignee_email().unwrap_or_default();
+            let requested = device
+                .assigned_to
+                .as_ref()
+                .and_then(|u| users.get(&u.id))
+                .and_then(SnipeUser::get_keyboard_layout)
+                .unwrap_or("-");
+            println!(
+                "  {} | EOL {} | {user} | keyboard {} | requested {requested}",
+                device.display_name(),
+                device.eol_date().unwrap_or_default(),
+                device.keyboard_layout().unwrap_or("-"),
+            );
+        };
+
+        println!("Laptops at end of life ({}):", report.end_of_life.len());
+        report.end_of_life.iter().for_each(|d| line(d));
+        println!("Laptops to replace within {REPLACEMENT_NOTICE_DAYS} days ({}):", report.within_three_months.len());
+        report.within_three_months.iter().for_each(|d| line(d));
+        let year: i32 = today[..4].parse()?;
+        println!("Laptops reaching end of life in {year}: {}", report.current_year);
+        println!("Laptops reaching end of life in {}: {}", year + 1, report.next_year);
+        if report.without_eol > 0 {
+            eprintln!("⚠️  {} laptops have no end-of-life date", report.without_eol);
+        }
         Ok(())
     }
 
@@ -741,7 +1061,7 @@ impl App {
         Ok(())
     }
 
-    fn check_lenovo_warranty(&self) -> Result<()> {
+    fn check_lenovo_warranty(&self, all: bool) -> Result<()> {
         let hardware = self.snipe_get("hardware")?;
         let rows: Vec<SnipeDevice> = hardware["rows"]
             .as_array()
@@ -756,6 +1076,9 @@ impl App {
         let mut failed = 0;
 
         for device in rows {
+            if !all && device.has_purchase_date() {
+                continue;
+            }
             if let Some(serial) = &device.serial {
                 let device_name = device
                     .name
@@ -764,11 +1087,14 @@ impl App {
                     .unwrap_or_else(|| serial.clone());
                 match self.get_lenovo_warranty_info(serial) {
                     Ok(warranty_info) => {
-                        if let Some((start_date, product_name)) = warranty_info {
-                            println!("{}: {} - Warranty start date: {}", device_name, product_name, start_date);
-                            
-                            if let Err(e) = self.update_snipe_purchase_date(device.id, &start_date) {
-                                eprintln!("Failed to update purchase date for {}: {}", device_name, e);
+                        if let Some(warranty) = warranty_info {
+                            println!(
+                                "{}: {} - Warranty start date: {}",
+                                device_name, warranty.product_name, warranty.base_start_date
+                            );
+
+                            if let Err(e) = self.update_snipe_from_lenovo(&device, &warranty) {
+                                eprintln!("Failed to update {} from Lenovo: {}", device_name, e);
                                 failed += 1;
                             } else {
                                 updated += 1;
@@ -786,35 +1112,103 @@ impl App {
             }
         }
 
-        println!("Lenovo warranty check: {checked} checked, {updated} purchase dates updated, {failed} failed");
+        println!("Lenovo warranty check: {checked} checked, {updated} assets updated, {failed} failed");
         Ok(())
     }
 
-    fn update_snipe_purchase_date(&self, device_id: u64, start_date: &str) -> Result<()> {
+    /// Update purchase date and model from Lenovo data (only the changed fields).
+    fn update_snipe_from_lenovo(&self, device: &SnipeDevice, warranty: &LenovoWarrantyInfo) -> Result<()> {
+        let current_date = device.purchase_date.as_ref().and_then(|d| d.date.as_deref());
+        let purchase_date = (current_date != Some(warranty.base_start_date.as_str()))
+            .then_some(warranty.base_start_date.as_str());
+
+        let eol_date = add_years(&warranty.base_start_date, LAPTOP_LIFETIME_YEARS)?;
+        let current_eol = device.asset_eol_date.as_ref().and_then(|d| d.date.as_deref());
+        let asset_eol_date = (current_eol != Some(eol_date.as_str())).then_some(eol_date.as_str());
+
+        let model_id = match warranty.model_name() {
+            Some(name) => Some(self.snipe_model_id(name)?),
+            None => None,
+        }
+        .filter(|id| device.model.as_ref().map(|m| m.id) != Some(*id));
+
+        if purchase_date.is_none() && asset_eol_date.is_none() && model_id.is_none() {
+            return Ok(());
+        }
         let payload = SnipeAssetUpdate {
-            purchase_date: Some(start_date),
+            purchase_date,
+            asset_eol_date,
+            model_id,
             ..Default::default()
         };
-        self.snipe_request("PUT", &format!("hardware/{device_id}"), Some(&payload))?;
+        self.snipe_request("PUT", &format!("hardware/{}", device.id), Some(&payload))?;
         Ok(())
     }
 
-    fn get_lenovo_warranty_info(&self, serial: &str) -> Result<Option<(String, String)>> {
-        let normalized_serial = normalize_serial(serial).to_uppercase();
-        
-        let product_info = self.get_lenovo_product_info(&normalized_serial)?;
-        if product_info.is_empty() {
-            return Ok(None);
+    /// Find a Snipe-IT model by name, creating it if missing
+    /// (category Laptop, manufacturer Lenovo, fieldset Laptop, depreciation Laptop Standard).
+    fn snipe_model_id(&self, name: &str) -> Result<u64> {
+        let key = name.to_lowercase();
+        if let Some(id) = self.model_ids.borrow().get(&key) {
+            return Ok(*id);
         }
-
-        let product_id = &product_info[0];
-        let machine_type = self.extract_machine_type(product_id)?;
-        
-        let warranty_info = self.get_lenovo_ibase_info(&normalized_serial, &machine_type)?;
-        Ok(warranty_info)
+        let id = match self.snipe_find_by_name("models", name)? {
+            Some(model) => model.id,
+            None => {
+                let category = self
+                    .snipe_find_by_name("categories", "Laptop")?
+                    .ok_or_else(|| anyhow!("Snipe-IT category 'Laptop' not found"))?;
+                let manufacturer = self
+                    .snipe_find_by_name("manufacturers", "Lenovo")?
+                    .ok_or_else(|| anyhow!("Snipe-IT manufacturer 'Lenovo' not found"))?;
+                let fieldset = self
+                    .snipe_find_by_name("fieldsets", "Laptop")?
+                    .ok_or_else(|| anyhow!("Snipe-IT custom fieldset 'Laptop' not found"))?;
+                let depreciation = self
+                    .snipe_find_by_name("depreciations", "Laptop Standard")?
+                    .ok_or_else(|| anyhow!("Snipe-IT depreciation 'Laptop Standard' not found"))?;
+                let payload = NewSnipeModel {
+                    name,
+                    category_id: category.id,
+                    manufacturer_id: manufacturer.id,
+                    fieldset_id: fieldset.id,
+                    depreciation_id: depreciation.id,
+                };
+                let response = self.snipe_request("POST", "models", Some(&payload))?;
+                let created: SnipeNamedRef = serde_json::from_value(response["payload"].clone())
+                    .context("Snipe-IT model creation response did not contain a payload")?;
+                println!("Created Snipe-IT model '{name}'");
+                created.id
+            }
+        };
+        self.model_ids.borrow_mut().insert(key, id);
+        Ok(id)
     }
 
-    fn get_lenovo_product_info(&self, serial: &str) -> Result<Vec<Value>> {
+    /// Search a Snipe-IT collection and return the row whose name matches exactly (case-insensitive).
+    fn snipe_find_by_name(&self, collection: &str, name: &str) -> Result<Option<SnipeNamedRef>> {
+        let mut url = self.snipe_url(&[collection])?;
+        url.query_pairs_mut().append_pair("search", name);
+        let result = self.snipe_get_url(url.as_str())?;
+        let rows: Vec<SnipeNamedRef> = serde_json::from_value(result["rows"].clone())
+            .with_context(|| format!("Snipe-IT {collection} search response did not contain a valid rows array"))?;
+        Ok(rows
+            .into_iter()
+            .find(|row| row.name.as_deref().is_some_and(|n| n.trim().eq_ignore_ascii_case(name.trim()))))
+    }
+
+    fn get_lenovo_warranty_info(&self, serial: &str) -> Result<Option<LenovoWarrantyInfo>> {
+        let normalized_serial = normalize_serial(serial).to_uppercase();
+
+        let Some(product) = self.get_lenovo_product_info(&normalized_serial)? else {
+            return Ok(None);
+        };
+        let machine_type = product.machine_type()?;
+
+        self.get_lenovo_ibase_info(&normalized_serial, machine_type)
+    }
+
+    fn get_lenovo_product_info(&self, serial: &str) -> Result<Option<LenovoProductInfo>> {
         let payload = LenovoProductQuery { product_id: serial };
 
         let url = "https://pcsupport.lenovo.com/lu/en/api/v4/mse/v2/getproducts";
@@ -826,27 +1220,15 @@ impl App {
         let response = send_json(request, Some(&payload))
             .context("Failed to get Lenovo product info")?;
 
-        if let Some(arr) = response.as_array() {
-            Ok(arr.clone())
+        let products: Vec<LenovoProductInfo> = if response.is_array() {
+            serde_json::from_value(response).context("invalid Lenovo product info")?
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        Ok(products.into_iter().next())
     }
 
-    fn extract_machine_type(&self, product: &Value) -> Result<String> {
-        let full_id = product["Id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Product has no Id field"))?;
-        
-        let parts: Vec<&str> = full_id.split('/').collect();
-        if parts.len() >= 4 {
-            Ok(parts[3].to_owned())
-        } else {
-            Err(anyhow!("Cannot extract machine type from product id"))
-        }
-    }
-
-    fn get_lenovo_ibase_info(&self, serial: &str, machine_type: &str) -> Result<Option<(String, String)>> {
+    fn get_lenovo_ibase_info(&self, serial: &str, machine_type: &str) -> Result<Option<LenovoWarrantyInfo>> {
         let payload = LenovoIbaseQuery {
             serial_number: serial,
             machine_type,
@@ -863,15 +1245,9 @@ impl App {
         let response = send_json(request, Some(&payload))
             .context("Failed to get Lenovo warranty info")?;
 
-        if let Some(data) = response.get("data").and_then(|d| d.get("machineInfo")) {
-            if let Some(start_date) = data.get("baseStartDate").and_then(|d| d.as_str()) {
-                if let Some(product_name) = data.get("productName").and_then(|n| n.as_str()) {
-                    return Ok(Some((start_date.to_owned(), product_name.to_owned())));
-                }
-            }
-        }
-
-        Ok(None)
+        let response: LenovoIbaseResponse =
+            serde_json::from_value(response).context("invalid Lenovo warranty info")?;
+        Ok(response.data.and_then(|data| data.machine_info))
     }
 
     fn graph_collection(&self, first_url: &str) -> Result<Vec<Value>> {
@@ -983,6 +1359,72 @@ impl App {
     }
 }
 
+/// Asset end of life = purchase date + this many years.
+const LAPTOP_LIFETIME_YEARS: i32 = 4;
+
+/// Add years to a `YYYY-MM-DD` date (29 Feb becomes 28 Feb on non-leap years).
+fn add_years(date: &str, years: i32) -> Result<String> {
+    let invalid = || anyhow!("invalid date '{date}', expected YYYY-MM-DD");
+    let date_part = date.get(..10).ok_or_else(invalid)?;
+    let mut parts = date_part.split('-').map(|p| p.parse::<i32>());
+    let (Some(Ok(year)), Some(Ok(month)), Some(Ok(day)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid());
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+    let year = year + years;
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let day = if month == 2 && day == 29 && !is_leap { 28 } else { day };
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// Days since 1970-01-01 for a civil date (proleptic Gregorian).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// `YYYY-MM-DD` for a number of days since 1970-01-01.
+fn civil_from_days(days: i64) -> String {
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Add days to a `YYYY-MM-DD` date.
+fn add_days(date: &str, days: i64) -> Result<String> {
+    let invalid = || anyhow!("invalid date '{date}', expected YYYY-MM-DD");
+    let mut parts = date.get(..10).ok_or_else(invalid)?.split('-').map(|p| p.parse::<i64>());
+    let (Some(Ok(year)), Some(Ok(month)), Some(Ok(day)), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err(invalid());
+    };
+    Ok(civil_from_days(days_from_civil(year, month, day) + days))
+}
+
+/// Today's date (UTC) as `YYYY-MM-DD`.
+fn today() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    civil_from_days((seconds / 86_400) as i64)
+}
+
 fn normalize_serial(serial: &str) -> String {
     serial
         .chars()
@@ -1091,6 +1533,7 @@ fn employee_names(employee: &Value) -> (String, String) {
                     SnipeStatusLabel { id: 4, name: Some("Deployed".into()) },
                     SnipeStatusLabel { id: 9, name: Some("Not In Intune".into()) },
                 ]),
+                model_ids: RefCell::new(HashMap::new()),
             }
         }
 
@@ -1130,7 +1573,7 @@ fn employee_names(employee: &Value) -> (String, String) {
         }
 
         fn device(assigned_to: Option<SnipeUser>) -> SnipeDevice {
-            SnipeDevice { id: 17, name: Some("Laptop".into()), asset_tag: None, serial: Some("serial".into()), assigned_to, status_label: None }
+            SnipeDevice { id: 17, name: Some("Laptop".into()), asset_tag: None, serial: Some("serial".into()), assigned_to, status_label: None, purchase_date: None, asset_eol_date: None, model: None, category: None, custom_fields: HashMap::new() }
         }
 
         #[test]
@@ -1149,6 +1592,7 @@ fn employee_names(employee: &Value) -> (String, String) {
                 {"id": 2, "serial": "zz 99", "status_label": {"id": 5, "name": "server mode"}},
                 {"id": 3, "serial": "CD34", "status_label": {"id": 4, "name": "Deployed"}},
                 {"id": 4, "serial": "", "status_label": {"id": 4, "name": "Deployed"}},
+                {"id": 5, "serial": "OTHER", "asset_tag": "00000000-0000-0000-0000-000000000001"},
             ])).unwrap();
             let mut intune = intune_device();
             intune.serial_number = Some("ab12".into());
@@ -1156,6 +1600,38 @@ fn employee_names(employee: &Value) -> (String, String) {
             assert_eq!(missing.iter().map(|d| d.id).collect::<Vec<_>>(), vec![2, 3]);
             assert!(is_server_mode(missing[0]));
             assert!(!is_server_mode(missing[1]));
+        }
+
+        #[test]
+        fn groups_laptops_by_assignee_email_and_finds_unassigned_ones() {
+            let snipe: Vec<SnipeDevice> = serde_json::from_value(json!([
+                {"id": 1, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 5, "email": "A@example.com"}},
+                {"id": 2, "category": {"id": 1, "name": "laptop"}, "assigned_to": {"id": 5, "email": "a@example.com"}},
+                {"id": 3, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 6, "email": "b@example.com"}},
+                {"id": 4, "category": {"id": 1, "name": "Laptop"}},
+                {"id": 5, "category": {"id": 1, "name": "Laptop"}, "status_label": {"id": 5, "name": "Server mode"}},
+                {"id": 6, "category": {"id": 2, "name": "Monitor"}, "assigned_to": {"id": 6, "email": "b@example.com"}},
+                {"id": 7, "category": {"id": 2, "name": "Monitor"}},
+            ])).unwrap();
+            let laptops = laptops_by_assignee(&snipe);
+            assert_eq!(laptops["a@example.com"].iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(laptops["b@example.com"].iter().map(|d| d.id).collect::<Vec<_>>(), vec![3]);
+            assert_eq!(unassigned_laptops(&snipe).iter().map(|d| d.id).collect::<Vec<_>>(), vec![4]);
+        }
+
+        #[test]
+        fn matches_device_by_serial_then_by_asset_tag() {
+            let snipe: Vec<SnipeDevice> = serde_json::from_value(json!([
+                {"id": 1, "serial": "OTHER", "asset_tag": "00000000-0000-0000-0000-000000000001"},
+                {"id": 2, "serial": "SERIAL"},
+            ])).unwrap();
+            let mut intune = intune_device();
+            intune.serial_number = Some("SERIAL".into());
+            assert_eq!(find_snipe_device(&snipe, &intune).map(|d| d.id), Some(2));
+            intune.serial_number = Some("UNKNOWN".into());
+            assert_eq!(find_snipe_device(&snipe, &intune).map(|d| d.id), Some(1));
+            intune.serial_number = None;
+            assert_eq!(find_snipe_device(&snipe, &intune).map(|d| d.id), Some(1));
         }
 
         fn intune_device() -> IntuneDevice {
@@ -1189,7 +1665,7 @@ fn employee_names(employee: &Value) -> (String, String) {
                 ("200 OK", r#"{"rows":[]}"#),
             ] {
                 let (app, server) = mock_snipe(vec![(status, response)]);
-                let user = SnipeUser { id: 42, name: None, email: Some("user@example.com".into()) };
+                let user = SnipeUser { id: 42, name: None, email: Some("user@example.com".into()), notes: None };
                 assert!(matches!(app.assign_device_in_snipe(&device(None), &user, "user@example.com").unwrap(), UserCheckStatus::UserMismatch));
                 server.join().unwrap();
             }
@@ -1198,17 +1674,95 @@ fn employee_names(employee: &Value) -> (String, String) {
         #[test]
         fn does_not_checkout_existing_assignment_without_email() {
             let app = test_app("http://127.0.0.1:9".into());
-            let user = SnipeUser { id: 9, name: Some("Existing assignee".into()), email: None };
+            let user = SnipeUser { id: 9, name: Some("Existing assignee".into()), email: None, notes: None };
             assert!(matches!(app.check_device_user_mismatch(&device(Some(user)), &intune_device()).unwrap(), UserCheckStatus::UserMismatch));
         }
 
         #[test]
         fn compares_assigned_users_by_email_even_without_names() {
             let app = test_app("http://127.0.0.1:9".into());
-            let user = SnipeUser { id: 9, name: None, email: Some("USER@example.com".into()) };
+            let user = SnipeUser { id: 9, name: None, email: Some("USER@example.com".into()), notes: None };
             assert!(matches!(app.check_device_user_mismatch(&device(Some(user)), &intune_device()).unwrap(), UserCheckStatus::CorrectlyAssigned));
-            let other = SnipeUser { id: 10, name: None, email: Some("other@example.com".into()) };
+            let other = SnipeUser { id: 10, name: None, email: Some("other@example.com".into()), notes: None };
             assert!(matches!(app.check_device_user_mismatch(&device(Some(other)), &intune_device()).unwrap(), UserCheckStatus::UserMismatch));
+        }
+
+        #[test]
+        fn adds_years_to_dates() {
+            assert_eq!(add_years("2022-03-15", 4).unwrap(), "2026-03-15");
+            assert_eq!(add_years("2024-02-29", 4).unwrap(), "2028-02-29");
+            assert_eq!(add_years("2020-02-29", 1).unwrap(), "2021-02-28");
+            assert!(add_years("15/03/2022", 4).is_err());
+        }
+
+        #[test]
+        fn adds_days_to_dates() {
+            assert_eq!(add_days("2026-11-19", 90).unwrap(), "2027-02-17");
+            assert_eq!(add_days("2024-02-28", 1).unwrap(), "2024-02-29");
+            assert_eq!(civil_from_days(0), "1970-01-01");
+        }
+
+        #[test]
+        fn reports_laptops_to_replace() {
+            let snipe: Vec<SnipeDevice> = serde_json::from_value(json!([
+                {"id": 1, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2025-06-01"}},
+                {"id": 2, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-03-01"}},
+                {"id": 3, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-12-15"}},
+                {"id": 4, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2027-02-10"}},
+                {"id": 5, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2027-09-01"}},
+                {"id": 6, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-01-01"}, "status_label": {"id": 5, "name": "Server mode"}},
+                {"id": 7, "category": {"id": 2, "name": "Monitor"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-01-01"}},
+                {"id": 8, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}},
+                {"id": 9, "category": {"id": 1, "name": "Laptop"}, "asset_eol_date": {"date": "2026-01-01"}},
+            ])).unwrap();
+            let report = replacement_report(&snipe, "2026-11-19").unwrap();
+            assert_eq!(report.end_of_life.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 2]);
+            assert_eq!(report.within_three_months.iter().map(|d| d.id).collect::<Vec<_>>(), vec![3, 4]);
+            assert_eq!((report.current_year, report.next_year, report.without_eol), (2, 2, 1));
+        }
+
+        #[test]
+        fn reads_keyboard_layouts() {
+            let user = |notes: Option<&str>| SnipeUser { id: 1, name: None, email: None, notes: notes.map(Into::into) };
+            assert_eq!(user(Some("Bureau 3\nKeyboard: AZERTY BE\nautre")).get_keyboard_layout(), Some("AZERTY BE"));
+            assert_eq!(user(Some("Bureau 3<br>Keyboard: QWERTZ CH")).get_keyboard_layout(), Some("QWERTZ CH"));
+            assert_eq!(user(Some("Keyboard:")).get_keyboard_layout(), None);
+            assert_eq!(user(None).get_keyboard_layout(), None);
+            let laptops: Vec<SnipeDevice> = serde_json::from_value(json!([
+                {"id": 1, "custom_fields": {"Keyboard": {"field": "_snipeit_keyboard_3", "value": "QWERTY US"}}},
+                {"id": 2, "custom_fields": []},
+            ])).unwrap();
+            assert_eq!(laptops[0].keyboard_layout(), Some("QWERTY US"));
+            assert_eq!(laptops[1].keyboard_layout(), None);
+        }
+
+        #[test]
+        fn lenovo_model_name_stops_at_first_parenthesis() {
+            let warranty = |name: &str| LenovoWarrantyInfo { product_name: name.into(), base_start_date: String::new() };
+            assert_eq!(warranty("ThinkPad T14 Gen 3 (Type 21AH, 21AJ) - Type 21AH").model_name(), Some("ThinkPad T14 Gen 3"));
+            assert_eq!(warranty(" ThinkPad X1 ").model_name(), Some("ThinkPad X1"));
+            assert_eq!(warranty(" (Type 21AH)").model_name(), None);
+        }
+
+        #[test]
+        fn creates_missing_snipe_model_as_lenovo_laptop() {
+            let (app, server) = mock_snipe(vec![
+                ("200 OK", r#"{"rows":[{"id":3,"name":"ThinkPad T14 Gen 3 AMD"}]}"#),
+                ("200 OK", r#"{"rows":[{"id":5,"name":"Laptop"}]}"#),
+                ("200 OK", r#"{"rows":[{"id":6,"name":"Lenovo"}]}"#),
+                ("200 OK", r#"{"total":2,"rows":[{"id":7,"name":"Desktop"},{"id":8,"name":"Laptop"}]}"#),
+                ("200 OK", r#"{"rows":[{"id":9,"name":"Laptop Standard"}]}"#),
+                ("200 OK", r#"{"status":"success","payload":{"id":42,"name":"ThinkPad T14 Gen 3"}}"#),
+            ]);
+            assert_eq!(app.snipe_model_id("ThinkPad T14 Gen 3").unwrap(), 42);
+            assert_eq!(app.snipe_model_id("thinkpad t14 gen 3").unwrap(), 42);
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 6);
+            assert!(requests[5].0.starts_with("POST /api/v1/models "));
+            assert_eq!(
+                requests[5].1,
+                json!({"name": "ThinkPad T14 Gen 3", "category_id": 5, "manufacturer_id": 6, "fieldset_id": 8, "depreciation_id": 9})
+            );
         }
 
         #[test]
