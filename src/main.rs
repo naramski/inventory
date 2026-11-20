@@ -60,6 +60,12 @@ enum Command {
     },
     /// Report laptops at end of life or to replace soon ("Server mode" excepted).
     Replace,
+    /// Licence cashflow from this month to December of next year.
+    Budget {
+        /// Number of months shown side by side.
+        #[arg(long, default_value_t = 3)]
+        columns: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -428,6 +434,320 @@ fn replacement_report<'a>(snipe_devices: &'a [SnipeDevice], today: &str) -> Resu
     Ok(report)
 }
 
+/// Snipe-IT depreciation names giving the licence billing period.
+const MONTHLY_LICENCE: &str = "Monthly Licence";
+const ANNUAL_LICENCE: &str = "Annual Licence";
+
+/// Snipe-IT returns amounts as formatted strings ("2,200.00" or "2.200,00") or numbers.
+fn amount_or_none<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => parse_amount(&s),
+        _ => None,
+    })
+}
+
+/// Parse an amount, the last `.` or `,` followed by 1 or 2 digits being the decimal separator.
+fn parse_amount(text: &str) -> Option<f64> {
+    let digits: String = text.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '-')).collect();
+    let normalized = match digits.rfind(['.', ',']) {
+        Some(pos) if (1..=2).contains(&(digits.len() - pos - 1)) => {
+            format!("{}.{}", digits[..pos].replace(['.', ','], ""), &digits[pos + 1..])
+        }
+        _ => digits.replace(['.', ','], ""),
+    };
+    normalized.parse().ok()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnipeLicense {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "amount_or_none")]
+    purchase_cost: Option<f64>,
+    #[serde(default, deserialize_with = "amount_or_none")]
+    purchase_cost_numeric: Option<f64>,
+    #[serde(default)]
+    depreciation: Option<SnipeNamedRef>,
+    #[serde(default)]
+    purchase_date: Option<SnipeDate>,
+    #[serde(default)]
+    expiration_date: Option<SnipeDate>,
+    #[serde(default)]
+    termination_date: Option<SnipeDate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Billing {
+    Monthly,
+    Annual,
+}
+
+impl SnipeLicense {
+    fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| format!("licence #{}", self.id))
+    }
+
+    fn cost(&self) -> Option<f64> {
+        self.purchase_cost_numeric.or(self.purchase_cost)
+    }
+
+    fn depreciation_name(&self) -> Option<&str> {
+        self.depreciation.as_ref().and_then(|d| d.name.as_deref()).map(str::trim)
+    }
+
+    /// Billing period from the depreciation name ("Licence" or "License").
+    fn billing(&self) -> Option<Billing> {
+        let name = self.depreciation_name()?.replace("License", "Licence");
+        if name.eq_ignore_ascii_case(MONTHLY_LICENCE) {
+            Some(Billing::Monthly)
+        } else if name.eq_ignore_ascii_case(ANNUAL_LICENCE) {
+            Some(Billing::Annual)
+        } else {
+            None
+        }
+    }
+}
+
+/// A month, as `year * 12 + (month - 1)` so that months compare and increment simply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Month(i32);
+
+impl Month {
+    fn new(year: i32, month: u32) -> Self {
+        Month(year * 12 + month as i32 - 1)
+    }
+
+    /// Month of a `YYYY-MM-DD` date.
+    fn of(date: &str) -> Option<Self> {
+        let year = date.get(..4)?.parse().ok()?;
+        let month: u32 = date.get(5..7)?.parse().ok()?;
+        (1..=12).contains(&month).then(|| Month::new(year, month))
+    }
+
+    fn of_snipe(date: Option<&SnipeDate>) -> Option<Self> {
+        date.and_then(|d| d.date.as_deref()).and_then(Month::of)
+    }
+
+    fn year(self) -> i32 {
+        self.0.div_euclid(12)
+    }
+
+    /// 1 to 12.
+    fn number(self) -> u32 {
+        self.0.rem_euclid(12) as u32 + 1
+    }
+
+    fn next(self) -> Self {
+        Month(self.0 + 1)
+    }
+}
+
+impl std::fmt::Display for Month {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const NAMES: [&str; 12] = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ];
+        write!(f, "{} {}", NAMES[self.number() as usize - 1], self.year())
+    }
+}
+
+struct BudgetLine {
+    name: String,
+    amount: f64,
+}
+
+struct BudgetMonth {
+    month: Month,
+    lines: Vec<BudgetLine>,
+}
+
+impl BudgetMonth {
+    fn total(&self) -> f64 {
+        self.lines.iter().fold(0.0, |total, l| total + l.amount)
+    }
+}
+
+struct Cashflow {
+    months: Vec<BudgetMonth>,
+    warnings: Vec<String>,
+}
+
+/// Licence payments from the month of `today` to December of the next year.
+/// Monthly licences are due every month from their purchase date; annual licences
+/// in the month of their expiration date (renewal), else of their purchase date.
+/// Nothing is due after the termination date.
+fn license_cashflow(licenses: &[SnipeLicense], today: &str) -> Result<Cashflow> {
+    let first = Month::of(today).ok_or_else(|| anyhow!("invalid date '{today}'"))?;
+    let last = Month::new(first.year() + 1, 12);
+    let mut months = Vec::new();
+    let mut month = first;
+    while month <= last {
+        months.push(BudgetMonth { month, lines: Vec::new() });
+        month = month.next();
+    }
+
+    let mut warnings = Vec::new();
+    for license in licenses {
+        let name = license.display_name();
+        let Some(billing) = license.billing() else {
+            match license.depreciation_name() {
+                Some(value) => warnings.push(format!("{name}: depreciation '{value}' is not recognized")),
+                None => warnings.push(format!("{name}: no depreciation, expected '{MONTHLY_LICENCE}' or '{ANNUAL_LICENCE}'")),
+            }
+            continue;
+        };
+        let Some(amount) = license.cost() else {
+            warnings.push(format!("{name}: no purchase cost"));
+            continue;
+        };
+        let start = Month::of_snipe(license.purchase_date.as_ref());
+        let end = Month::of_snipe(license.termination_date.as_ref());
+        let due_month = match billing {
+            Billing::Monthly => None,
+            Billing::Annual => match Month::of_snipe(license.expiration_date.as_ref()).or(start) {
+                Some(due) => Some(due.number()),
+                None => {
+                    warnings.push(format!("{name}: annual licence without expiration or purchase date"));
+                    continue;
+                }
+            },
+        };
+        for budget_month in &mut months {
+            let month = budget_month.month;
+            let active = start.is_none_or(|s| s <= month) && end.is_none_or(|e| month <= e);
+            if active && due_month.is_none_or(|due| due == month.number()) {
+                budget_month.lines.push(BudgetLine { name: name.clone(), amount });
+            }
+        }
+    }
+    for month in &mut months {
+        month.lines.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    }
+    Ok(Cashflow { months, warnings })
+}
+
+const LAPTOP_REPLACEMENT: &str = "Laptop replacement";
+const LATE_REPLACEMENT: &str = "Late replacement";
+
+/// Add the replacement of assigned laptops ("Server mode" excepted) at `price` each:
+/// in their end-of-life month, or in the first month when it has already passed.
+/// Laptops of the same month are grouped on one line.
+fn add_laptop_replacements(cashflow: &mut Cashflow, devices: &[SnipeDevice], price: f64) {
+    let Some(first) = cashflow.months.first().map(|m| m.month) else {
+        return;
+    };
+    let mut counts: HashMap<(Month, &str), usize> = HashMap::new();
+    let mut without_eol = 0;
+    for device in devices.iter().filter(|d| d.is_laptop() && d.assigned_to.is_some() && !is_server_mode(d)) {
+        match device.eol_date().and_then(Month::of) {
+            Some(eol) if eol < first => *counts.entry((first, LATE_REPLACEMENT)).or_default() += 1,
+            Some(eol) => *counts.entry((eol, LAPTOP_REPLACEMENT)).or_default() += 1,
+            None => without_eol += 1,
+        }
+    }
+    if without_eol > 0 {
+        cashflow.warnings.push(format!("{without_eol} assigned laptops have no end-of-life date, not budgeted"));
+    }
+    for month in &mut cashflow.months {
+        for name in [LATE_REPLACEMENT, LAPTOP_REPLACEMENT] {
+            if let Some(&count) = counts.get(&(month.month, name)) {
+                month.lines.push(BudgetLine { name: format!("{name} ({count})"), amount: count as f64 * price });
+            }
+        }
+        month.lines.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    }
+}
+
+/// `2200 €`, or `19.99 €` when there are cents.
+fn format_euros(amount: f64) -> String {
+    if amount.fract().abs() < 0.005 {
+        format!("{amount:.0} €")
+    } else {
+        format!("{amount:.2} €")
+    }
+}
+
+/// Lines of one month block: title, underline, licences, total.
+fn month_block(month: &BudgetMonth) -> Vec<String> {
+    let title = month.month.to_string();
+    let mut lines = vec![title.clone(), "=".repeat(title.chars().count())];
+    lines.extend(month.lines.iter().map(|l| format!("* {}: {}", l.name, format_euros(l.amount))));
+    lines.push(format!("Total: {}", format_euros(month.total())));
+    lines
+}
+
+/// Month blocks laid out side by side, `columns` per row.
+fn render_cashflow(months: &[BudgetMonth], columns: usize) -> String {
+    const GAP: usize = 4;
+    let blocks: Vec<Vec<String>> = months.iter().map(month_block).collect();
+    let width = blocks.iter().flatten().map(|l| l.chars().count()).max().unwrap_or(0);
+    let mut out = String::new();
+    for row in blocks.chunks(columns.max(1)) {
+        let height = row.iter().map(Vec::len).max().unwrap_or(0);
+        for i in 0..height {
+            // The total goes on the last line of every block, so totals align.
+            let cells: Vec<&str> = row
+                .iter()
+                .map(|block| {
+                    if i == height - 1 {
+                        block[block.len() - 1].as_str()
+                    } else if i < block.len() - 1 {
+                        block[i].as_str()
+                    } else {
+                        ""
+                    }
+                })
+                .collect();
+            let line = cells
+                .iter()
+                .map(|c| format!("{c:<width$}{}", " ".repeat(GAP)))
+                .collect::<String>();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Amount represented by one cell of the bar chart.
+const BAR_STEP: f64 = 1000.0;
+
+/// Vertical ASCII bar chart of the monthly totals, one column per month and one
+/// cell per started `BAR_STEP`, so that any amount due is visible.
+fn render_bar_chart(months: &[BudgetMonth]) -> String {
+    const NAMES: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let heights: Vec<usize> = months.iter().map(|m| (m.total().max(0.0) / BAR_STEP).ceil() as usize).collect();
+    let max = heights.iter().copied().max().unwrap_or(0);
+    let label_width = format!("{:.0}", max.max(1) as f64 * BAR_STEP).len();
+    let mut out = String::new();
+    for level in (1..=max).rev() {
+        let mut line = format!("{:>label_width$.0} € |", level as f64 * BAR_STEP);
+        for &height in &heights {
+            line.push_str(if height >= level { " ###" } else { "    " });
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    let indent = " ".repeat(label_width + 3);
+    out.push_str(&format!("{indent}+{}\n", "-".repeat(4 * months.len())));
+    let names: String = months.iter().map(|m| format!(" {}", NAMES[m.month.number() as usize - 1])).collect();
+    let years: String = months.iter().map(|m| format!(" {:>3}", format!("'{:02}", m.month.year() % 100))).collect();
+    out.push_str(&format!("{indent} {names}\n{indent} {years}\n"));
+    out
+}
+
+/// Sum of the monthly totals of a year.
+fn year_total(months: &[BudgetMonth], year: i32) -> f64 {
+    months.iter().filter(|m| m.month.year() == year).fold(0.0, |total, m| total + m.total())
+}
+
 fn has_status(device: &SnipeDevice, status: &str) -> bool {
     device
         .status_label
@@ -499,10 +819,17 @@ struct DefaultsConfig {
     model_id: u64,
     #[serde(default = "default_ready_to_deploy_status")]
     ready_to_deploy_status: String,
+    /// Estimated price of a replacement laptop, in euros (budget).
+    #[serde(default = "default_laptop_budget")]
+    laptop_budget: f64,
 }
 
 fn default_ready_to_deploy_status() -> String {
     "Ready to Deploy".to_owned()
+}
+
+fn default_laptop_budget() -> f64 {
+    1900.0
 }
 
 fn is_supported_os(device: &IntuneDevice) -> bool {
@@ -538,6 +865,7 @@ fn main() -> Result<()> {
         Command::Normalise => app.normalise_serials(),
         Command::Lenovo { all } => app.check_lenovo_warranty(all),
         Command::Replace => app.report_replacements(),
+        Command::Budget { columns } => app.report_budget(columns),
     }
 }
 
@@ -1008,6 +1336,46 @@ impl App {
         if report.without_eol > 0 {
             eprintln!("⚠️  {} laptops have no end-of-life date", report.without_eol);
         }
+        Ok(())
+    }
+
+    /// Every Snipe-IT licence (paginated).
+    fn get_snipe_licenses(&self) -> Result<Vec<SnipeLicense>> {
+        const PAGE: usize = 500;
+        let mut licenses = Vec::new();
+        loop {
+            let mut url = self.snipe_url(&["licenses"])?;
+            url.query_pairs_mut()
+                .append_pair("limit", &PAGE.to_string())
+                .append_pair("offset", &licenses.len().to_string());
+            let result = self.snipe_get_url(url.as_str())?;
+            let rows = result["rows"]
+                .as_array()
+                .ok_or_else(|| anyhow!("Snipe-IT licenses response did not contain a rows array"))?;
+            let count = rows.len();
+            for row in rows {
+                licenses.push(serde_json::from_value(row.clone()).context("invalid Snipe-IT licence")?);
+            }
+            let total = result["total"].as_u64().unwrap_or(0) as usize;
+            if count < PAGE || licenses.len() >= total {
+                return Ok(licenses);
+            }
+        }
+    }
+
+    fn report_budget(&self, columns: usize) -> Result<()> {
+        let licenses = self.get_snipe_licenses()?;
+        let mut cashflow = license_cashflow(&licenses, &today())?;
+        add_laptop_replacements(&mut cashflow, &self.get_snipe_devices()?, self.config.defaults.laptop_budget);
+        for warning in &cashflow.warnings {
+            eprintln!("⚠️  {warning}");
+        }
+        print!("{}", render_cashflow(&cashflow.months, columns));
+        print!("{}", render_bar_chart(&cashflow.months));
+        let year = cashflow.months.first().map_or(0, |m| m.month.year());
+        println!();
+        println!("Remaining committed for {year}: {}", format_euros(year_total(&cashflow.months, year)));
+        println!("To commit for {}: {}", year + 1, format_euros(year_total(&cashflow.months, year + 1)));
         Ok(())
     }
 
@@ -1525,6 +1893,7 @@ fn employee_names(employee: &Value) -> (String, String) {
                     defaults: DefaultsConfig {
                         model_id: 1,
                         ready_to_deploy_status: "Ready to Deploy".into(),
+                        laptop_budget: 1900.0,
                     },
                 },
                 graph_token: String::new(),
@@ -1719,6 +2088,112 @@ fn employee_names(employee: &Value) -> (String, String) {
             assert_eq!(report.end_of_life.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 2]);
             assert_eq!(report.within_three_months.iter().map(|d| d.id).collect::<Vec<_>>(), vec![3, 4]);
             assert_eq!((report.current_year, report.next_year, report.without_eol), (2, 2, 1));
+        }
+
+        #[test]
+        fn parses_snipe_amounts() {
+            assert_eq!(parse_amount("2,200.00"), Some(2200.0));
+            assert_eq!(parse_amount("2.200,50"), Some(2200.5));
+            assert_eq!(parse_amount("1 234,5 €"), Some(1234.5));
+            assert_eq!(parse_amount("19.99"), Some(19.99));
+            assert_eq!(parse_amount("1,000"), Some(1000.0));
+            assert_eq!(parse_amount(""), None);
+        }
+
+        #[test]
+        fn builds_license_cashflow() {
+            let licenses: Vec<SnipeLicense> = serde_json::from_value(json!([
+                {"id": 1, "name": "Microsoft 365", "purchase_cost": "100.00", "depreciation": {"id": 1, "name": "Monthly Licence"}, "purchase_date": {"date": "2026-01-01"}},
+                {"id": 2, "name": "Amazon", "purchase_cost": "2,200.00", "purchase_cost_numeric": 2200, "depreciation": {"id": 2, "name": "Annual Licence"}, "expiration_date": {"date": "2027-01-15"}},
+                {"id": 3, "name": "Late start", "purchase_cost": "10", "depreciation": {"id": 1, "name": "monthly licence"}, "purchase_date": {"date": "2027-11-03"}},
+                {"id": 4, "name": "Stopped", "purchase_cost": "5", "depreciation": {"id": 1, "name": "Monthly Licence"}, "termination_date": {"date": "2026-12-31"}},
+                {"id": 5, "name": "Unknown", "purchase_cost": "5", "depreciation": {"id": 3, "name": "3 years"}},
+                {"id": 6, "name": "No cost", "depreciation": {"id": 2, "name": "Annual Licence"}, "purchase_date": {"date": "2025-03-01"}},
+                {"id": 7, "name": "No date", "purchase_cost": "1", "depreciation": {"id": 2, "name": "Annual Licence"}},
+                {"id": 8, "name": "No depreciation", "purchase_cost": "1", "depreciation": null},
+            ])).unwrap();
+            let cashflow = license_cashflow(&licenses, "2026-11-20").unwrap();
+            assert_eq!(cashflow.months.len(), 14);
+            assert_eq!(cashflow.months[0].month.to_string(), "November 2026");
+            assert_eq!(cashflow.months[13].month.to_string(), "December 2027");
+            let names = |i: usize| cashflow.months[i].lines.iter().map(|l| l.name.as_str()).collect::<Vec<_>>();
+            assert_eq!(names(0), vec!["Microsoft 365", "Stopped"]);
+            assert_eq!(names(2), vec!["Amazon", "Microsoft 365"]);
+            assert_eq!(cashflow.months[2].total(), 2300.0);
+            assert_eq!(names(12), vec!["Late start", "Microsoft 365"]);
+            assert_eq!(cashflow.warnings, vec![
+                "Unknown: depreciation '3 years' is not recognized",
+                "No cost: no purchase cost",
+                "No date: annual licence without expiration or purchase date",
+                "No depreciation: no depreciation, expected 'Monthly Licence' or 'Annual Licence'",
+            ]);
+            assert_eq!(format_euros(2200.0), "2200 €");
+            assert_eq!(format_euros(19.9), "19.90 €");
+        }
+
+        #[test]
+        fn budgets_laptop_replacements() {
+            let devices: Vec<SnipeDevice> = serde_json::from_value(json!([
+                {"id": 1, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2025-06-01"}},
+                {"id": 2, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-10-31"}},
+                {"id": 3, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-11-25"}},
+                {"id": 4, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2027-03-10"}},
+                {"id": 5, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2027-03-20"}},
+                {"id": 6, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2028-01-01"}},
+                {"id": 7, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-01-01"}, "status_label": {"id": 5, "name": "Server mode"}},
+                {"id": 8, "category": {"id": 1, "name": "Laptop"}, "asset_eol_date": {"date": "2026-01-01"}},
+                {"id": 9, "category": {"id": 2, "name": "Monitor"}, "assigned_to": {"id": 1}, "asset_eol_date": {"date": "2026-01-01"}},
+                {"id": 10, "category": {"id": 1, "name": "Laptop"}, "assigned_to": {"id": 1}},
+            ])).unwrap();
+            let mut cashflow = license_cashflow(&[], "2026-11-20").unwrap();
+            add_laptop_replacements(&mut cashflow, &devices, 1900.0);
+            let lines = |i: usize| cashflow.months[i].lines.iter().map(|l| (l.name.as_str(), l.amount)).collect::<Vec<_>>();
+            assert_eq!(lines(0), vec![("Laptop replacement (1)", 1900.0), ("Late replacement (2)", 3800.0)]);
+            assert_eq!(lines(4), vec![("Laptop replacement (2)", 3800.0)]);
+            assert_eq!(cashflow.months.iter().map(|m| m.lines.len()).sum::<usize>(), 3);
+            assert_eq!(cashflow.warnings, vec!["1 assigned laptops have no end-of-life date, not budgeted"]);
+        }
+
+        #[test]
+        fn renders_cashflow_in_columns() {
+            let month = |m: u32, lines: &[(&str, f64)]| BudgetMonth {
+                month: Month::new(2027, m),
+                lines: lines.iter().map(|(n, a)| BudgetLine { name: (*n).into(), amount: *a }).collect(),
+            };
+            let months = vec![month(1, &[("Amazon", 2200.0), ("M365", 100.0)]), month(2, &[("M365", 100.0)]), month(3, &[])];
+            let expected = "\
+January 2027        February 2027
+============        =============
+* Amazon: 2200 €    * M365: 100 €
+* M365: 100 €
+Total: 2300 €       Total: 100 €
+
+March 2027
+==========
+Total: 0 €
+
+";
+            assert_eq!(render_cashflow(&months, 2), expected);
+        }
+
+        #[test]
+        fn renders_bar_chart_and_year_totals() {
+            let month = |y: i32, m: u32, amount: f64| BudgetMonth {
+                month: Month::new(y, m),
+                lines: vec![BudgetLine { name: "x".into(), amount }],
+            };
+            let months = vec![month(2026, 12, 2200.0), month(2027, 1, 100.0), month(2027, 2, 0.0), month(2027, 3, 1000.0)];
+            let expected = "\
+3000 € | ###
+2000 € | ###
+1000 € | ### ###     ###
+       +----------------
+         Dec Jan Feb Mar
+         '26 '27 '27 '27
+";
+            assert_eq!(render_bar_chart(&months), expected);
+            assert_eq!(year_total(&months, 2026), 2200.0);
+            assert_eq!(year_total(&months, 2027), 1100.0);
         }
 
         #[test]

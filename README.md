@@ -11,6 +11,7 @@ Inventory reconciles Microsoft Intune and Entra ID with Snipe-IT.
 - `inventory lenovo` looks up the Lenovo warranty start date of Snipe-IT assets that have a serial number but no purchase date, and sets it as their purchase date. With `--all`, every asset with a serial number is checked and updated.
 
 - `inventory replace` lists assigned Snipe-IT laptops (category "Laptop", "Server mode" assets excepted) whose end-of-life date has passed, and those reaching end of life within the next 90 days, with the laptop keyboard (asset custom field "Keyboard") and the keyboard requested by the user (a `Keyboard: XXXX` line in the user notes, read only). It also counts the laptops reaching end of life during the current year and the next year.
+- `inventory budget` prints the licence cashflow from the current month to December of next year, from the Snipe-IT licences. The billing period is read from the licence depreciation: "Monthly Licence" licences are due every month (from their purchase date), "Annual Licence" licences in the month of their expiration date (or purchase date when there is none). Nothing is due after the termination date. The purchase cost is the amount paid per period. Licences with another depreciation, no cost or no date are reported as warnings. Assigned laptops ("Server mode" excepted) are budgeted as "Laptop replacement" in their end-of-life month, or as "Late replacement" in the current month when their end of life has passed, at `defaults.laptop_budget` each (1900 € when not set). Months are printed side by side, 3 per row by default (`--columns N`), followed by an ASCII bar chart of the monthly totals (one `###` cell per started 1000 €), the amount remaining for the current year and the amount for next year.
 
 Run a command with `--help` for CLI options. The config file defaults to `config.toml`; override it with `--config PATH`.
 
@@ -32,6 +33,7 @@ api_token = "YOUR_SNIPE_IT_API_TOKEN"
 [defaults]
 model_id = 1
 ready_to_deploy_status = "Ready to Deploy"
+laptop_budget = 1900
 ```
 
 ### Azure AD App Registration Permissions

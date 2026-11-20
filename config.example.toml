@@ -11,3 +11,4 @@ api_token = "YOUR_SNIPE_IT_API_TOKEN"
 [defaults]
 model_id = 1
 ready_to_deploy_status = "Ready to Deploy"
+laptop_budget = 1900
