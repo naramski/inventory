@@ -66,6 +66,12 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         columns: usize,
     },
+    /// List users with a keyboard preference, then users without one.
+    Keyboard {
+        /// Set the keyboard of the user whose email starts with EMAIL_PREFIX.
+        #[arg(long, num_args = 2, value_names = ["EMAIL_PREFIX", "LAYOUT"])]
+        set: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,7 +100,7 @@ struct SnipeUser {
     name: Option<String>,
     #[serde(default)]
     email: Option<String>,
-    /// Read only: never sent back to Snipe-IT.
+    /// Only sent back by `keyboard --set`, to change the `Keyboard:` line.
     #[serde(default)]
     notes: Option<String>,
 }
@@ -112,6 +118,69 @@ impl SnipeUser {
             .map(str::trim)
             .filter(|layout| !layout.is_empty())
     }
+
+    /// Notes with the `Keyboard:` line replaced (or added at the end), other lines kept.
+    fn notes_with_keyboard_layout(&self, layout: &str) -> String {
+        let mut lines: Vec<String> = self
+            .notes
+            .as_deref()
+            .unwrap_or_default()
+            .split(['\n', '\r'])
+            .flat_map(|line| line.split("<br>"))
+            .map(|line| unescape_html(line.trim_end()))
+            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !line.trim().starts_with(KEYBOARD_NOTE_PREFIX))
+            .collect();
+        lines.push(format!("{KEYBOARD_NOTE_PREFIX} {}", layout.trim()));
+        lines.join("\n")
+    }
+}
+
+/// Undo the HTML escaping Snipe-IT applies to notes in API responses.
+fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Users whose email starts with `prefix` (case insensitive).
+fn users_by_email_prefix<'a>(users: &'a [SnipeUser], prefix: &str) -> Vec<&'a SnipeUser> {
+    let prefix = prefix.trim().to_lowercase();
+    users
+        .iter()
+        .filter(|user| user.email.as_deref().is_some_and(|email| email.trim().to_lowercase().starts_with(&prefix)))
+        .collect()
+}
+
+/// Body of `PATCH users/{id}` for `keyboard --set`.
+#[derive(Debug, Serialize)]
+struct SnipeUserNotesUpdate<'a> {
+    notes: &'a str,
+}
+
+/// Snipe-IT users split by keyboard preference (`Keyboard: XXXX` line in the notes).
+struct KeyboardReport<'a> {
+    /// Users with a preference, with the requested layout, sorted by name.
+    with_preference: Vec<(&'a SnipeUser, &'a str)>,
+    /// Users without a preference, sorted by name.
+    without_preference: Vec<&'a SnipeUser>,
+}
+
+fn keyboard_report(users: &[SnipeUser]) -> KeyboardReport<'_> {
+    let sort_key = |user: &SnipeUser| user.name.as_deref().unwrap_or_default().to_lowercase();
+    let mut report = KeyboardReport { with_preference: Vec::new(), without_preference: Vec::new() };
+    for user in users {
+        match user.get_keyboard_layout() {
+            Some(layout) => report.with_preference.push((user, layout)),
+            None => report.without_preference.push(user),
+        }
+    }
+    report.with_preference.sort_by_key(|(user, _)| sort_key(user));
+    report.without_preference.sort_by_key(|user| sort_key(user));
+    report
 }
 
 /// Custom field value returned by the Snipe-IT API.
@@ -866,6 +935,8 @@ fn main() -> Result<()> {
         Command::Lenovo { all } => app.check_lenovo_warranty(all),
         Command::Replace => app.report_replacements(),
         Command::Budget { columns } => app.report_budget(columns),
+        Command::Keyboard { set: None } => app.report_keyboards(),
+        Command::Keyboard { set: Some(args) } => app.set_keyboard(&args[0], &args[1]),
     }
 }
 
@@ -1302,6 +1373,56 @@ impl App {
             "Check complete: {missing_employee} employees missing from Snipe-IT, {without_laptop} without a laptop, {several_laptops} with several laptops, {} unassigned laptops, {missing_from_intune} devices missing from Intune ({marked} marked '{NOT_IN_INTUNE_STATUS}', {server_mode} in '{SERVER_MODE_STATUS}' ignored)",
             unassigned.len()
         );
+        Ok(())
+    }
+
+    fn report_keyboards(&self) -> Result<()> {
+        let users = self.get_snipe_users()?;
+        let report = keyboard_report(&users);
+        let label = |user: &SnipeUser| {
+            format!(
+                "{} <{}>",
+                user.name.as_deref().unwrap_or("-"),
+                user.email.as_deref().unwrap_or("-")
+            )
+        };
+        println!("Users with a keyboard preference ({}):", report.with_preference.len());
+        for (user, layout) in &report.with_preference {
+            println!("  {} | {layout}", label(user));
+        }
+        println!();
+        println!("Users without a keyboard preference ({}):", report.without_preference.len());
+        for user in &report.without_preference {
+            println!("  {}", label(user));
+        }
+        Ok(())
+    }
+
+    fn set_keyboard(&self, email_prefix: &str, layout: &str) -> Result<()> {
+        if email_prefix.trim().is_empty() || layout.trim().is_empty() {
+            return Err(anyhow!("email prefix and keyboard layout must not be empty"));
+        }
+        let users = self.get_snipe_users()?;
+        let user = match users_by_email_prefix(&users, email_prefix).as_slice() {
+            [user] => *user,
+            [] => return Err(anyhow!("no Snipe-IT user email starts with '{email_prefix}'")),
+            matches => {
+                let emails: Vec<&str> = matches.iter().filter_map(|u| u.email.as_deref()).collect();
+                return Err(anyhow!("'{email_prefix}' matches several users: {}", emails.join(", ")));
+            }
+        };
+        let email = user.email.as_deref().unwrap_or_default();
+        let previous = user.get_keyboard_layout();
+        if previous == Some(layout.trim()) {
+            println!("{email} already has keyboard {}", layout.trim());
+            return Ok(());
+        }
+        let notes = user.notes_with_keyboard_layout(layout);
+        let response = self.snipe_request("PATCH", &format!("users/{}", user.id), Some(&SnipeUserNotesUpdate { notes: &notes }))?;
+        if response["status"].as_str() != Some("success") {
+            return Err(anyhow!("Snipe-IT update of {email} failed: {}", response["messages"]));
+        }
+        println!("{email}: keyboard {} → {}", previous.unwrap_or("-"), layout.trim());
         Ok(())
     }
 
@@ -2209,6 +2330,47 @@ Total: 0 €
             ])).unwrap();
             assert_eq!(laptops[0].keyboard_layout(), Some("QWERTY US"));
             assert_eq!(laptops[1].keyboard_layout(), None);
+        }
+
+        #[test]
+        fn sets_keyboard_line_and_finds_users_by_email_prefix() {
+            let user = |id: u64, email: &str, notes: Option<&str>| SnipeUser {
+                id,
+                name: None,
+                email: Some(email.into()),
+                notes: notes.map(Into::into),
+            };
+            assert_eq!(user(1, "a@x.lu", None).notes_with_keyboard_layout("AZERTY BE"), "Keyboard: AZERTY BE");
+            assert_eq!(
+                user(1, "a@x.lu", Some("Bureau 3<br>Keyboard: QWERTY US<br>R&amp;D")).notes_with_keyboard_layout(" AZERTY BE "),
+                "Bureau 3\nR&D\nKeyboard: AZERTY BE"
+            );
+            let users = vec![user(1, "belinda@nowina.lu", None), user(2, "Ben@nowina.lu", None)];
+            let ids = |prefix| users_by_email_prefix(&users, prefix).iter().map(|u| u.id).collect::<Vec<_>>();
+            assert_eq!(ids("belind"), vec![1]);
+            assert_eq!(ids("BE"), vec![1, 2]);
+            assert!(ids("zz").is_empty());
+        }
+
+        #[test]
+        fn splits_users_by_keyboard_preference() {
+            let user = |id: u64, name: &str, notes: Option<&str>| SnipeUser {
+                id,
+                name: Some(name.into()),
+                email: None,
+                notes: notes.map(Into::into),
+            };
+            let users = vec![
+                user(1, "Zoé", Some("Keyboard: AZERTY BE")),
+                user(2, "bob", None),
+                user(3, "Alice", Some("Keyboard: QWERTY US")),
+                user(4, "Anna", Some("Bureau 2")),
+            ];
+            let report = keyboard_report(&users);
+            let with: Vec<(u64, &str)> = report.with_preference.iter().map(|(u, l)| (u.id, *l)).collect();
+            assert_eq!(with, vec![(3, "QWERTY US"), (1, "AZERTY BE")]);
+            let without: Vec<u64> = report.without_preference.iter().map(|u| u.id).collect();
+            assert_eq!(without, vec![4, 2]);
         }
 
         #[test]
